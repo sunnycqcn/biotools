@@ -1,4 +1,6 @@
 ####recursively delete all files of a specific extension in the current directory
 find . -name "*.bak" -type f -delete
+find /isilon/projects/J-001382_clubroot_src_chen/fuf/BLgenome/ -name "*.sh" -type f -exec cp {} . \;
+rsync -av --include='*.sh' --include='*/' --exclude='*' /isilon/projects/J-001382_clubroot_src_chen/fuf/BLgenome/ .
 ###gene statistics summary
  agat_sp_statistics.pl --gff Striga_hermonithica_Striga.gff3 - o STH.gene.summary.txt
