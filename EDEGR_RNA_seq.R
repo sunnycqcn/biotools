@@ -1,21 +1,26 @@
 #!/usr/bin/env Rscript
 
-# Function to check and install required packages
+# Load necessary libraries
 check_and_install_packages <- function(packages) {
-  for (pkg in packages) {
-    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
-      install.packages(pkg, repos = "http://cran.us.r-project.org")
-      library(pkg, character.only = TRUE)
-    }
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if (length(new_packages)) {
+    options(repos = c(CRAN = "https://cloud.r-project.org/"))  # Set CRAN mirror
+    install.packages(new_packages)
   }
 }
 
-# List of necessary packages
-packages <- c("edgeR", "optparse", "pheatmap", "RColorBrewer", "ggplot2")
-check_and_install_packages(packages)
+# List of required packages
+required_packages <- c("edgeR", "optparse", "reshape2", "ggplot2", "pheatmap")
+check_and_install_packages(required_packages)
+
+# Load libraries
+library(edgeR)
+library(optparse)
+library(reshape2)
+library(ggplot2)
+library(pheatmap)
 
 # Define command-line arguments
-library(optparse)
 option_list <- list(
   make_option(c("-i", "--input"), type = "character", default = NULL, 
               help = "Path to input count table (e.g., all_count_table.txt or sample.list)", metavar = "character"),
@@ -65,10 +70,20 @@ generate_count_table <- function(sample_list_file, output_file) {
     
     sample_counts[[2]] <- as.numeric(gsub("[^0-9]", "0", sample_counts[[2]]))
     
+    if (nrow(sample_counts) == 0) {
+      cat("No counts remaining after filtering for sample:", sample_file, "\n")
+      next
+    }
+    
     count_data[[basename(sample_file)]] <- sample_counts  
   }
   
+  if (length(count_data) == 0) {
+    stop("No valid sample files provided. Please check your sample list.", call. = FALSE)
+  }
+  
   all_counts <- Reduce(function(x, y) merge(x, y, by = "gene_id", all = TRUE), count_data)
+  
   write.table(all_counts, file = output_file, sep = "\t", row.names = FALSE, quote = FALSE)
 }
 
@@ -79,16 +94,50 @@ if (grepl("sample.list$", input_file)) {
 }
 
 data <- read.table(input_file, header = TRUE, row.names = 1, stringsAsFactors = FALSE)
+
+if (is.null(data) || nrow(data) == 0) {
+  stop("Error: The input count data is empty. Please check your input data.", call. = FALSE)
+}
+
+cat("Input count data preview:\n")
+print(head(data))
+cat("Data dimensions:", dim(data), "\n")
+
 data <- as.matrix(data)
 
+if (!is.numeric(data)) {
+  data[!sapply(data, is.numeric)] <- 0
+  data <- apply(data, 2, function(x) as.numeric(as.character(x)))
+}
+
+if (!is.matrix(data) || length(dim(data)) < 2) {
+  stop("Error: The data is not a matrix or does not have at least two dimensions.", call. = FALSE)
+}
+
+if (any(rowSums(data) == 0)) {
+  cat("Removing genes with all zero counts.\n")
+  data <- data[rowSums(data) > 0, ]
+}
+
+if (nrow(data) == 0) {
+  stop("Error: The count data is empty after filtering. Please check your input data.", call. = FALSE)
+}
+
 # Filter genes based on CPM threshold (CPM >= opt$cpm in at least 2 samples)
-library(edgeR)
 d <- DGEList(counts = data)
 d <- calcNormFactors(d)
 cps <- cpm(d)
+
 keep <- rowSums(cps >= cpm_thresh) >= 2
 data <- data[keep, ]
+
+if (nrow(data) == 0) {
+  stop("Error: The count data is empty after filtering for CPM. Please check your input data.", call. = FALSE)
+}
+
 grp <- as.factor(substr(colnames(data), 1, factor_num))
+cat("Group summary:\n")
+print(table(grp))
 
 d <- DGEList(counts = data, group = grp)
 d <- calcNormFactors(d)
@@ -113,6 +162,11 @@ run_dge <- function(d, mm, grp_levels, p_value_thresh, fdr_thresh, logFC_thresh,
       group1 <- grp_levels[i]
       group2 <- grp_levels[j]
       
+      # If comparison list is provided, skip groups not in list
+      if (!is.null(compare_list) && !any(compare_pairs$V1 == group1 & compare_pairs$V2 == group2)) {
+        next
+      }
+      
       contrast_name <- paste0(group1, "-vs-", group2)
       con <- makeContrasts(contrasts = paste0("grp", group1, "-grp", group2), levels = mm)
       
@@ -122,88 +176,105 @@ run_dge <- function(d, mm, grp_levels, p_value_thresh, fdr_thresh, logFC_thresh,
       lrt <- glmLRT(f, contrast = con)
       
       tt <- topTags(lrt, n = Inf)$table
+      
+      # Rename columns for clarity
+      colnames(tt) <- paste0(colnames(tt), "_", contrast_name)
+
       filtered_tt <- tt[tt$PValue <= p_value_thresh & tt$FDR <= fdr_thresh & abs(tt$logFC) >= logFC_thresh, ]
       
       if (nrow(filtered_tt) > 0) {
         filtered_tt$gene_id <- rownames(filtered_tt)
-        colnames(filtered_tt)[colnames(filtered_tt) == "logFC"] <- paste0("logFC_", contrast_name)
+      } else {
+        filtered_tt <- data.frame(gene_id = character(0), logFC = numeric(0), PValue = numeric(0), FDR = numeric(0))
       }
       
       combined_results[[contrast_name]] <- filtered_tt
       all_gene_ids <- unique(c(all_gene_ids, filtered_tt$gene_id))
-      
-      write.table(filtered_tt, file = paste0(contrast_name, "_filtered.xls"), sep = "\t", row.names = FALSE, quote = FALSE)
     }
   }
   
   combined_table <- data.frame(gene_id = all_gene_ids)
-  for (contrast_name in names(combined_results)) {
-    contrast_data <- combined_results[[contrast_name]]
-    if (nrow(contrast_data) > 0) {
-      combined_table <- merge(combined_table, contrast_data[, c("gene_id", paste0("logFC_", contrast_name))], by = "gene_id", all.x = TRUE)
-    }
+  for (contrast in names(combined_results)) {
+    combined_table <- merge(combined_table, combined_results[[contrast]], by = "gene_id", all.x = TRUE)
   }
   
   write.table(combined_table, file = "combined_logFC_results.xls", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
 }
 
-# Run DGE
+# Run the DGE analysis
 run_dge(d, mm, levels(grp), p_value_thresh, fdr_thresh, logFC_thresh, compare_list_file)
 
-# Plot pairwise sample comparison
-plot_pairwise_comparison <- function(d) {
-  plotMDS(d, main = "Pairwise Sample Comparison (MDS Plot)")
-  dev.copy(png, "pairwise_sample_comparison.png")
-  dev.off()
-}
-
-# BCV Plot
-plot_bcv <- function(d) {
-  plotBCV(d, main = "Biological Coefficient of Variation (BCV)")
-  dev.copy(png, "bcv_plot.png")
-  dev.off()
-}
-
-# Mean-Variance plot
-plot_mean_variance <- function(d) {
-  plotMeanVar(d, main = "Mean-Variance Plot")
-  dev.copy(png, "mean_variance_plot.png")
-  dev.off()
-}
-
-# PCA Plot
-plot_pca <- function(d) {
-  pca <- prcomp(t(cpm(d)))
-  df <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], group = d$samples$group)
+# Function for pairwise comparison plot
+pairwise_comparison_plot <- function(d) {
+  comparison <- as.data.frame(d$counts)
+  comparison <- comparison[rowSums(comparison) > 0, ]
   
-  ggplot(df, aes(PC1, PC2, color = group)) +
+  comparison_long <- reshape2::melt(comparison, variable.name = "Sample", value.name = "Count")
+  
+  # Ensure Gene column exists for facetting
+  comparison_long$Gene <- rownames(comparison)
+  
+  ggplot(comparison_long, aes(x = Sample, y = Count)) +
+    geom_boxplot() +
+    facet_wrap(~ Gene) +
+    theme(axis.text.x = element_text(angle = 90)) +
+    ggtitle("Pairwise Sample Comparison Plot") +
+    ylab("Count") +
+    xlab("Sample")
+}
+
+# Create pairwise comparison plot
+pairwise_comparison_plot(d)
+
+# Function for BCV plot
+bcv_plot <- function(d) {
+  plotBCV(d)
+  title("Biological Coefficient of Variation Plot")
+}
+
+# Create BCV plot
+bcv_plot(d)
+
+# Function for mean-variance plot
+mean_variance_plot <- function(d) {
+  plotMeanVar(d, show.text = TRUE, pch = 20, col = ifelse(d$tagwise.dispersion < 0.5, "blue", "red"))
+  title("Mean-Variance Plot")
+}
+
+# Create mean-variance plot
+mean_variance_plot(d)
+
+# Function for PCA plot
+pca_plot <- function(d) {
+  pca <- prcomp(t(d$counts), center = TRUE, scale. = TRUE)
+  pca_df <- as.data.frame(pca$x)
+  pca_df$group <- d$samples$group
+  
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
     geom_point(size = 3) +
-    labs(title = "PCA Plot", x = "PC1", y = "PC2") +
-    theme_minimal()
-  
-  ggsave("pca_plot.png")
+    ggtitle("PCA Plot") +
+    xlab("Principal Component 1") +
+    ylab("Principal Component 2")
 }
 
-# Heatmap using group means for DEGs
-plot_heatmap_group_means <- function(d, degs) {
-  group_means <- sapply(levels(d$samples$group), function(g) rowMeans(d$counts[degs, d$samples$group == g, drop = FALSE]))
-  log_group_means <- log2(group_means + 1)
+# Create PCA plot
+pca_plot(d)
+
+# Function to plot heatmap of DEGs
+heatmap_deg <- function(d, p_value_thresh, fdr_thresh) {
+  results <- read.table("combined_logFC_results.xls", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+  degs <- results[results$FDR <= fdr_thresh & results$PValue <= p_value_thresh, ]
   
-  png("heatmap_DEGs_group_means.png")
-  pheatmap(log_group_means, cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE, show_colnames = TRUE,
-           color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(255))
-  dev.off()
+  if (nrow(degs) == 0) {
+    stop("No DEGs found with the specified thresholds.", call. = FALSE)
+  }
+  
+  heatmap_data <- d$counts[rownames(d$counts) %in% degs$gene_id, ]
+  pheatmap(heatmap_data, cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE, 
+           show_colnames = TRUE, main = "Heatmap of DEGs")
 }
 
-# Get DEGs for heatmap
-degs <- rownames(d$counts)[rowSums(cpm(d) > 1) >= 2]
-plot_heatmap_group_means(d, degs)
+# Create heatmap of DEGs
+heatmap_deg(d, p_value_thresh, fdr_thresh)
 
-# Call plots
-plot_pairwise_comparison(d)
-plot_bcv(d)
-plot_mean_variance(d)
-plot_pca(d)
-
-cat("All analyses and plots have been generated.\n")
-
+cat("Differential expression analysis completed.\n")
